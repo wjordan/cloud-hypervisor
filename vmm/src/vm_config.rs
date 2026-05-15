@@ -483,6 +483,11 @@ pub struct FsConfig {
     pub num_queues: usize,
     #[serde(default = "default_fsconfig_queue_size")]
     pub queue_size: u16,
+    /// Enable DAX shared-memory window. When set, the daemon must support the
+    /// SHMEM vhost-user protocol feature; the window size is negotiated via
+    /// GET_SHMEM_CONFIG.
+    #[serde(default)]
+    pub dax: bool,
 }
 
 pub fn default_fsconfig_num_queues() -> usize {

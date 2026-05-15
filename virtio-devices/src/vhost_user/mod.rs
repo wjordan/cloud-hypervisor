@@ -162,6 +162,12 @@ pub enum Error {
     VringBasesCountMismatch(usize, usize),
     #[error("Backend state and vring bases must both be present or both be absent")]
     InconsistentBackendState,
+    #[error("DAX was requested but the backend does not support the SHMEM protocol feature")]
+    DaxNotSupported,
+    #[error("Failed to get shared memory configuration from backend")]
+    VhostUserGetShmemConfig(#[source] VhostError),
+    #[error("Backend reported {0} shared memory regions; virtio-fs expects exactly 1")]
+    FsUnexpectedShmemRegions(u32),
     #[error("Failed to create timerfd")]
     TimerFdCreate(#[source] io::Error),
     #[error("Failed to arm timerfd")]

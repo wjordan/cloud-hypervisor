@@ -1945,7 +1945,7 @@ impl GenericVhostUserConfig {
 impl FsConfig {
     pub const SYNTAX: &'static str = "virtio-fs parameters \
     \"tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,\
-    queue_size=<size_of_each_queue>,id=<device_id>,\
+    queue_size=<size_of_each_queue>,dax=on|off,id=<device_id>,\
     pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(fs: &str) -> Result<Self> {
@@ -1955,6 +1955,7 @@ impl FsConfig {
             .add("queue_size")
             .add("num_queues")
             .add("socket")
+            .add("dax")
             .add_all(PciDeviceCommonConfig::OPTIONS);
         parser.parse(fs).map_err(Error::ParseFileSystem)?;
 
@@ -1972,6 +1973,13 @@ impl FsConfig {
             .convert("num_queues")
             .map_err(Error::ParseFileSystem)?
             .unwrap_or_else(default_fsconfig_num_queues);
+        // Default to DAX off so existing configs are unaffected. Enabling
+        // requires a daemon that advertises the SHMEM protocol feature.
+        let dax = parser
+            .convert::<Toggle>("dax")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or(Toggle(false))
+            .0;
 
         let pci_common = PciDeviceCommonConfig::parse(fs)?;
 
@@ -1981,6 +1989,7 @@ impl FsConfig {
             socket,
             num_queues,
             queue_size,
+            dax,
         })
     }
 
