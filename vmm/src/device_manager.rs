@@ -3186,6 +3186,23 @@ impl DeviceManager {
 
         let mut node = device_node!(id);
 
+        // Restore: the DAX window's GPA range was preserved in the device
+        // tree (Resource::MmioAddressRange). Fs::new skips the SHMEM size
+        // negotiation on the restore path, so recover base+size here and
+        // re-allocate the exact same region below — the restored guest's PCI
+        // BAR and virtio-fs driver state still point at it.
+        let saved_dax_range = self
+            .device_tree
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(|node| {
+                node.resources.iter().find_map(|r| match r {
+                    Resource::MmioAddressRange { base, size } => Some((*base, *size)),
+                    _ => None,
+                })
+            });
+
         if let Some(fs_socket) = fs_cfg.socket.to_str() {
             let (mut virtio_fs_device, dax_cache_size) = virtio_devices::vhost_user::Fs::new(
                 id.clone(),
@@ -3204,16 +3221,22 @@ impl DeviceManager {
             )
             .map_err(DeviceManagerError::CreateVirtioFs)?;
 
-            // When the daemon advertised a DAX window, reserve a chunk of
-            // 64-bit MMIO space for it and back it with an anonymous PROT_NONE
-            // mapping. SHMEM_MAP requests from the daemon will later overlay
-            // file pages into this region; until then any guest access faults.
-            if let Some(cache_size) = dax_cache_size {
+            // When the daemon advertised a DAX window (fresh boot: allocator
+            // picks the GPA) or the snapshot recorded one (restore: pin the
+            // saved GPA), reserve that chunk of 64-bit MMIO space and back it
+            // with an anonymous PROT_NONE mapping. SHMEM_MAP requests from the
+            // daemon will later overlay file pages into this region; until
+            // then any guest access faults.
+            let dax_window = match dax_cache_size {
+                Some(size) => Some((None, size)),
+                None => saved_dax_range.map(|(base, size)| (Some(GuestAddress(base)), size)),
+            };
+            if let Some((fixed_base, cache_size)) = dax_window {
                 let cache_base = self.pci_segments[fs_cfg.pci_common.pci_segment as usize]
                     .mem64_allocator
                     .lock()
                     .unwrap()
-                    .allocate(None, cache_size as GuestUsize, Some(0x0020_0000))
+                    .allocate(fixed_base, cache_size as GuestUsize, Some(0x0020_0000))
                     .ok_or(DeviceManagerError::FsRangeAllocation)?
                     .raw_value();
 
