@@ -1558,6 +1558,8 @@ impl CpuManager {
             return;
         };
         let vcpu = vcpu.lock().unwrap();
+        let start = std::time::Instant::now();
+        let mut done = 0u64;
         for &(gpa, size) in ranges {
             if let Err(e) = vcpu.vcpu.pre_fault_memory(gpa, size) {
                 // Unsupported is the common case on older kernels; say it once
@@ -1567,8 +1569,19 @@ impl CpuManager {
                     return;
                 }
                 warn!("Failed to pre-fault guest memory at 0x{gpa:x} (size 0x{size:x}): {e}");
+                continue;
             }
+            done += size;
         }
+        // Worth a line: the cost scales with the folio order of whatever backs
+        // guest memory, so an unexpectedly slow pre-fault is the symptom of a
+        // page cache that is not in large folios.
+        info!(
+            "Pre-faulted {} MiB of guest memory across {} region(s) in {:?}",
+            done >> 20,
+            ranges.len(),
+            start.elapsed()
+        );
     }
 
     pub fn resize(&mut self, desired_vcpus: u32) -> Result<bool> {
