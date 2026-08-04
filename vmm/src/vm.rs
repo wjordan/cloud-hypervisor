@@ -3007,6 +3007,13 @@ impl Vm {
         // still stopped and holding their mutexes is uncontended. Restored
         // guests touch most of their memory almost immediately, so faulting it
         // in one entry at a time on the far side of resume is pure latency.
+        //
+        // A file-backed region is pre-faulted only where its file holds data.
+        // A restored memory file is typically sparse — its holes are RAM the
+        // guest never touched — and faulting a hole in costs the walk time,
+        // instantiates a zero page in the cache, and raises residency, all for
+        // memory nothing has ever read. Extents are rounded outward to 2 MiB
+        // so an aligned huge mapping stays possible at each end.
         if self.pre_fault_memory {
             use vm_memory::{Address, GuestMemory, GuestMemoryRegion};
 
@@ -3014,9 +3021,23 @@ impl Vm {
                 let mm = self.memory_manager.lock().unwrap();
                 let guest_memory = mm.guest_memory();
                 let mem = guest_memory.memory();
-                mem.iter()
-                    .map(|region| (region.start_addr().raw_value(), region.len()))
-                    .collect::<Vec<_>>()
+                let mut ranges = Vec::new();
+                for region in mem.iter() {
+                    let gpa = region.start_addr().raw_value();
+                    let len = region.len();
+                    match region
+                        .file_offset()
+                        .and_then(|fo| file_data_tiles(fo.file(), fo.start(), len).ok())
+                    {
+                        Some(tiles) => {
+                            ranges.extend(tiles.into_iter().map(|(off, size)| (gpa + off, size)));
+                        }
+                        // Anonymous region, or a filesystem that cannot report
+                        // holes: pre-fault all of it.
+                        None => ranges.push((gpa, len)),
+                    }
+                }
+                ranges
             };
             self.cpu_manager.lock().unwrap().pre_fault_memory(&ranges);
         }
@@ -3650,10 +3671,160 @@ impl GuestDebuggable for Vm {
     }
 }
 
+/// The granule pre-fault ranges are aligned to: one PMD-level page-table entry
+/// covers 2 MiB, and KVM can only install one where the whole aligned range is
+/// mapped.
+const PRE_FAULT_TILE: u64 = 2 << 20;
+
+/// Returns the data-holding ranges of the `len` bytes of `file` starting at
+/// `start`, as `(offset, size)` pairs relative to `start`, rounded outward to
+/// whole 2 MiB tiles and coalesced. Walks the file with SEEK_DATA/SEEK_HOLE on
+/// a duplicated descriptor so the shared one's position is untouched. An error
+/// (e.g. a filesystem that cannot report holes) means the caller should treat
+/// the whole range as data.
+fn file_data_tiles(file: &File, start: u64, len: u64) -> io::Result<Vec<(u64, u64)>> {
+    use std::os::unix::io::AsRawFd;
+
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: FFI call duplicating a descriptor this reference keeps valid.
+    let fd = unsafe { libc::dup(file.as_raw_fd()) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let seek = |offset: u64, whence: i32| -> io::Result<i64> {
+        // SAFETY: FFI call on the descriptor duplicated above.
+        let pos = unsafe { libc::lseek(fd, offset as libc::off_t, whence) };
+        if pos < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(pos)
+    };
+    let mut extents = Vec::new();
+    let mut off = start;
+    let result = loop {
+        let data = match seek(off, libc::SEEK_DATA) {
+            Ok(pos) => pos as u64,
+            // No data between off and the end of the file.
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => break Ok(()),
+            Err(e) => break Err(e),
+        };
+        if data >= end {
+            break Ok(());
+        }
+        let hole = match seek(data, libc::SEEK_HOLE) {
+            Ok(pos) => pos as u64,
+            Err(e) => break Err(e),
+        };
+        extents.push((data, hole.min(end)));
+        if hole >= end {
+            break Ok(());
+        }
+        off = hole;
+    };
+    // SAFETY: closing the descriptor duplicated above.
+    unsafe { libc::close(fd) };
+    result?;
+    Ok(round_extents_to_tiles(&extents, start, end))
+}
+
+/// Rounds each extent outward to 2 MiB tile boundaries, clamps to
+/// `[start, end)`, coalesces neighbours, and rebases the result to `start` as
+/// `(offset, size)` pairs.
+fn round_extents_to_tiles(extents: &[(u64, u64)], start: u64, end: u64) -> Vec<(u64, u64)> {
+    let mut runs: Vec<(u64, u64)> = Vec::new(); // absolute [lo, hi)
+    for &(data, hole) in extents {
+        let lo = (data & !(PRE_FAULT_TILE - 1)).max(start);
+        let hi = ((hole + PRE_FAULT_TILE - 1) & !(PRE_FAULT_TILE - 1)).min(end);
+        if hi <= lo {
+            continue;
+        }
+        if let Some(last) = runs.last_mut()
+            && lo <= last.1
+        {
+            last.1 = last.1.max(hi);
+            continue;
+        }
+        runs.push((lo, hi));
+    }
+    runs.into_iter()
+        .map(|(lo, hi)| (lo - start, hi - lo))
+        .collect()
+}
+
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    const T: u64 = PRE_FAULT_TILE;
+
+    #[test]
+    fn test_round_extents_to_tiles() {
+        // Aligned extent maps to itself.
+        assert_eq!(
+            round_extents_to_tiles(&[(0, 4 * T)], 0, 4 * T),
+            vec![(0, 4 * T)]
+        );
+        // One data page still claims its whole tile.
+        assert_eq!(
+            round_extents_to_tiles(&[(T + 4096, T + 8192)], 0, 4 * T),
+            vec![(T, T)]
+        );
+        // Unaligned extents round outward and coalesce when their tiles meet.
+        assert_eq!(
+            round_extents_to_tiles(&[(100, T + 100), (2 * T - 10, 3 * T)], 0, 4 * T),
+            vec![(0, 3 * T)]
+        );
+        // Distant extents stay separate.
+        assert_eq!(
+            round_extents_to_tiles(&[(0, 4096), (3 * T, 3 * T + 4096)], 0, 4 * T),
+            vec![(0, T), (3 * T, T)]
+        );
+        // Clamped to the region and rebased to its start.
+        assert_eq!(
+            round_extents_to_tiles(&[(5 * T + 10, 6 * T)], 4 * T, 8 * T),
+            vec![(T, T)]
+        );
+        // No data, no ranges.
+        assert_eq!(
+            round_extents_to_tiles(&[], 0, 4 * T),
+            Vec::<(u64, u64)>::new()
+        );
+    }
+
+    #[test]
+    fn test_file_data_tiles_sparse() {
+        use std::io::Write as _;
+
+        let mut file = tempfile::tempfile().unwrap();
+        file.set_len(8 * T).unwrap();
+        // Data in tile 0 and tile 5, holes elsewhere.
+        file.write_all(&[7u8; 4096]).unwrap();
+        file.seek(SeekFrom::Start(5 * T + 4096)).unwrap();
+        file.write_all(&[9u8; 4096]).unwrap();
+        file.sync_all().unwrap();
+
+        let tiles = file_data_tiles(&file, 0, 8 * T).unwrap();
+        // A filesystem without hole tracking legitimately reports one big
+        // extent; with hole tracking the two data tiles come back alone.
+        assert!(
+            tiles == vec![(0, T), (5 * T, T)] || tiles == vec![(0, 8 * T)],
+            "unexpected tiles: {tiles:?}"
+        );
+        // Either way every data byte is covered.
+        let covers = |off: u64| tiles.iter().any(|&(o, s)| o <= off && off < o + s);
+        assert!(covers(0));
+        assert!(covers(5 * T + 4096));
+
+        // The walk must not disturb the shared descriptor's file position.
+        assert_eq!(
+            file.stream_position().unwrap(),
+            5 * T + 8192,
+            "file position moved by the extent walk"
+        );
+    }
 
     fn test_vm_state_transitions(state: VmState) {
         match state {
