@@ -95,6 +95,7 @@ mod kvm {
     pub const KVM_SET_USER_MEMORY_REGION2: u64 = 0x40a0_ae49;
     pub const KVM_SET_MEMORY_ATTRIBUTES: u64 = 0x4020_aed2;
     pub const KVM_CREATE_GUEST_MEMFD: u64 = 0xc040_aed4;
+    pub const KVM_PRE_FAULT_MEMORY: u64 = 0xc040_aed5;
     pub const KVM_IRQFD: u64 = 0x4020_ae76;
     pub const KVM_IOEVENTFD: u64 = 0x4040_ae79;
     pub const KVM_SET_VCPU_EVENTS: u64 = 0x4040_aea0;
@@ -268,6 +269,9 @@ fn create_vmm_ioctl_seccomp_rule_common_kvm() -> Result<Vec<SeccompRule>, Backen
         )?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_MEMORY_ATTRIBUTES,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_CREATE_GUEST_MEMFD,)?],
+        // Restore pre-faults guest memory from this thread, taking a vCPU's
+        // mutex to issue the ioctl; without this rule it traps on SIGSYS.
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_PRE_FAULT_MEMORY,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_VCPU_EVENTS,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_NMI)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_NESTED_STATE)?],
