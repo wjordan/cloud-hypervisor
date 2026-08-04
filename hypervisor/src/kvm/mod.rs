@@ -12,6 +12,7 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::io;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use std::mem::offset_of;
 #[cfg(feature = "sev_snp")]
@@ -128,10 +129,12 @@ pub use kvm_ioctls::{self, Cap, Kvm, VcpuExit};
 use log::error;
 use thiserror::Error;
 use vfio_ioctls::VfioDeviceFd;
+use vmm_sys_util::ioctl::ioctl_with_mut_ref;
+#[cfg(feature = "tdx")]
+use vmm_sys_util::ioctl::ioctl_with_val;
+use vmm_sys_util::ioctl_iowr_nr;
 #[cfg(target_arch = "x86_64")]
 use vmm_sys_util::{fam::FamStruct, ioctl_io_nr};
-#[cfg(feature = "tdx")]
-use vmm_sys_util::{ioctl::ioctl_with_val, ioctl_iowr_nr};
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use crate::RegList;
@@ -214,6 +217,26 @@ const TDG_VP_VMCALL_INVALID_OPERAND: u64 = 0x8000000000000000;
 
 #[cfg(feature = "tdx")]
 ioctl_iowr_nr!(KVM_MEMORY_ENCRYPT_OP, KVMIO, 0xba, std::os::raw::c_ulong);
+
+/// Argument to `KVM_PRE_FAULT_MEMORY` (Linux 6.12 and later). Not yet exposed
+/// by kvm-bindings for this architecture, so it is declared here to match the
+/// kernel's `struct kvm_pre_fault_memory`.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+#[allow(non_camel_case_types)]
+pub struct kvm_pre_fault_memory {
+    pub gpa: u64,
+    pub size: u64,
+    pub flags: u64,
+    pub padding: [u64; 5],
+}
+
+ioctl_iowr_nr!(
+    KVM_PRE_FAULT_MEMORY,
+    kvm_bindings::KVMIO,
+    0xd5,
+    kvm_pre_fault_memory
+);
 
 #[cfg(feature = "tdx")]
 #[repr(u32)]
@@ -3378,6 +3401,47 @@ impl cpu::Vcpu for KvmVcpu {
         }
     }
 
+    ///
+    /// Populate the second-dimension page tables for [gpa, gpa + size).
+    ///
+    fn pre_fault_memory(&self, gpa: u64, size: u64) -> cpu::Result<()> {
+        // KVM_PRE_FAULT_MEMORY faults the range in for reading only, so it
+        // leaves a file-backed private mapping sharing its pages with the page
+        // cache; copy-on-write still happens per page on the guest's first
+        // write.
+        //
+        // The kernel walks the whole range internally and writes any
+        // unprocessed tail back into `range`, reporting success as long as it
+        // mapped at least one page. So a zero return with a non-empty tail
+        // means it stopped early and the walk has to be reissued; anything the
+        // reissue cannot get past comes back as a hard error, since a call that
+        // makes no progress at all returns the underlying errno.
+        let mut range = kvm_pre_fault_memory {
+            gpa,
+            size,
+            ..Default::default()
+        };
+        while range.size > 0 {
+            // SAFETY: FFI call with a correctly sized and initialized struct.
+            let ret = unsafe { ioctl_with_mut_ref(&self.fd, KVM_PRE_FAULT_MEMORY(), &mut range) };
+            if ret < 0 {
+                let e = io::Error::last_os_error();
+                return match e.raw_os_error() {
+                    // Kernel too old, or the VM type disallows pre-faulting.
+                    Some(libc::EINVAL) | Some(libc::ENOTTY) | Some(libc::EOPNOTSUPP) => {
+                        Err(cpu::HypervisorCpuError::PreFaultMemoryUnsupported)
+                    }
+                    // Interrupted without progress. Retrying would spin for as
+                    // long as the signal stays pending, and a partially
+                    // pre-faulted guest is still correct, so stop here.
+                    Some(libc::EINTR) => Ok(()),
+                    _ => Err(cpu::HypervisorCpuError::PreFaultMemory(e.into())),
+                };
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "sev_snp")]
     fn set_sev_control_register(&self, _vmsa_pfn: u64) -> cpu::Result<()> {
         Ok(())
@@ -3603,6 +3667,56 @@ impl KvmVcpu {
 
 #[cfg(test)]
 mod unit_tests {
+    /// Exercises the KVM_PRE_FAULT_MEMORY wiring against the running kernel:
+    /// the ioctl number, the struct layout, and the loop's exit condition are
+    /// all things a type check cannot confirm. Skipped where the kernel does
+    /// not have the capability, which is the documented fallback.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
+    fn test_pre_fault_memory() {
+        use super::*;
+
+        const MEM_SIZE: usize = 2 << 20;
+        const GPA: u64 = 0;
+
+        let Ok(kvm) = KvmHypervisor::new() else {
+            return; // no /dev/kvm in this environment
+        };
+        let hypervisor = Arc::new(kvm);
+        let vm = hypervisor
+            .create_vm(HypervisorVmConfig::default())
+            .expect("new VM fd creation failed");
+
+        // SAFETY: FFI call requesting a fresh anonymous mapping.
+        let host_addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                MEM_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(host_addr, libc::MAP_FAILED, "mmap failed");
+
+        // SAFETY: the slot refers to the mapping created just above, which
+        // stays valid until it is unmapped at the end of this test.
+        unsafe { vm.create_user_memory_region(0, GPA, MEM_SIZE, host_addr.cast(), false, false) }
+            .expect("failed to add memory region");
+
+        let vcpu = vm.create_vcpu(0, None).unwrap();
+        match vcpu.pre_fault_memory(GPA, MEM_SIZE as u64) {
+            Ok(()) => {}
+            // Older kernels, or a VM type that disallows pre-faulting.
+            Err(cpu::HypervisorCpuError::PreFaultMemoryUnsupported) => {}
+            Err(e) => panic!("pre_fault_memory failed: {e}"),
+        }
+
+        // SAFETY: unmapping the mapping created above.
+        unsafe { libc::munmap(host_addr, MEM_SIZE) };
+    }
+
     #[test]
     #[cfg(target_arch = "riscv64")]
     fn test_get_and_set_regs() {

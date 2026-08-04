@@ -1544,6 +1544,33 @@ impl CpuManager {
         Ok(())
     }
 
+    /// Populates the second-dimension page tables for `ranges` so a restored
+    /// guest does not fault its memory in one entry at a time on first touch.
+    ///
+    /// Purely an optimization: any failure is logged and skipped, because a
+    /// guest that faults its own memory in lazily still runs correctly. The
+    /// caller must not have started the vCPUs yet, since the ioctl takes the
+    /// vCPU mutex that a running vCPU holds for the duration of KVM_RUN.
+    pub fn pre_fault_memory(&self, ranges: &[(u64, u64)]) {
+        // The tables are per-VM rather than per-vCPU, so one vCPU covers them
+        // all; it just has to be a vCPU because that is what the ioctl takes.
+        let Some(vcpu) = self.vcpus.first() else {
+            return;
+        };
+        let vcpu = vcpu.lock().unwrap();
+        for &(gpa, size) in ranges {
+            if let Err(e) = vcpu.vcpu.pre_fault_memory(gpa, size) {
+                // Unsupported is the common case on older kernels; say it once
+                // and stop rather than repeating it for every region.
+                if matches!(e, HypervisorCpuError::PreFaultMemoryUnsupported) {
+                    info!("Pre-faulting guest memory is unavailable, skipping");
+                    return;
+                }
+                warn!("Failed to pre-fault guest memory at 0x{gpa:x} (size 0x{size:x}): {e}");
+            }
+        }
+    }
+
     pub fn resize(&mut self, desired_vcpus: u32) -> Result<bool> {
         if desired_vcpus.cmp(&self.present_vcpus()) == cmp::Ordering::Equal {
             return Ok(false);

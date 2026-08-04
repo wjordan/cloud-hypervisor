@@ -38,6 +38,16 @@ pub enum CpuVendor {
 /// Enum for CPU error
 pub enum HypervisorCpuError {
     ///
+    /// Pre-faulting guest memory is not available on this hypervisor or kernel
+    ///
+    #[error("Pre-faulting guest memory is not supported")]
+    PreFaultMemoryUnsupported,
+    ///
+    /// Pre-faulting guest memory failed
+    ///
+    #[error("Failed to pre-fault guest memory")]
+    PreFaultMemory(#[source] anyhow::Error),
+    ///
     /// Setting standard registers error
     ///
     #[error("Failed to set standard register")]
@@ -608,4 +618,16 @@ pub trait Vcpu: Send + Sync {
     /// Trigger NMI interrupt
     ///
     fn nmi(&self) -> Result<()>;
+    ///
+    /// Populates the second-dimension page tables for the guest-physical range
+    /// [gpa, gpa + size), so the guest does not fault them in one at a time on
+    /// first touch. Faults the range in for *reading*: it must not privately
+    /// copy memory the mapping shares with its backing file.
+    ///
+    /// Returns `PreFaultMemoryUnsupported` where the hypervisor cannot do this,
+    /// which callers are expected to treat as a non-fatal optimization miss.
+    ///
+    fn pre_fault_memory(&self, _gpa: u64, _size: u64) -> Result<()> {
+        Err(HypervisorCpuError::PreFaultMemoryUnsupported)
+    }
 }

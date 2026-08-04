@@ -539,6 +539,8 @@ pub struct Vm {
     #[cfg(not(target_arch = "riscv64"))]
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     stop_on_boot: bool,
+    // Populate the guest's page tables during restore, before it resumes.
+    pre_fault_memory: bool,
     load_payload_handle: Option<thread::JoinHandle<Result<EntryPoint>>>,
 }
 
@@ -576,6 +578,7 @@ impl Vm {
         console_resize_pipe: Option<Arc<File>>,
         original_termios: Arc<Mutex<Option<termios>>>,
         snapshot: Option<&Snapshot>,
+        pre_fault_memory: bool,
         #[cfg(feature = "igvm")] igvm_file: Option<IgvmFile>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new_from_memory_manager");
@@ -717,6 +720,7 @@ impl Vm {
             #[cfg(not(target_arch = "riscv64"))]
             hypervisor,
             stop_on_boot,
+            pre_fault_memory,
             load_payload_handle,
         })
     }
@@ -1335,6 +1339,7 @@ impl Vm {
         snapshot: Option<&Snapshot>,
         source_url: Option<&str>,
         prefault: Option<bool>,
+        pre_fault_memory: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
@@ -1427,6 +1432,7 @@ impl Vm {
             console_resize_pipe,
             original_termios,
             snapshot,
+            pre_fault_memory.unwrap_or(false),
             #[cfg(feature = "igvm")]
             igvm_file,
         )
@@ -2996,6 +3002,24 @@ impl Vm {
             .unwrap()
             .try_lock_disks()
             .map_err(Error::LockingError)?;
+
+        // Populate the guest's page tables before it runs, while the vCPUs are
+        // still stopped and holding their mutexes is uncontended. Restored
+        // guests touch most of their memory almost immediately, so faulting it
+        // in one entry at a time on the far side of resume is pure latency.
+        if self.pre_fault_memory {
+            use vm_memory::{Address, GuestMemory, GuestMemoryRegion};
+
+            let ranges = {
+                let mm = self.memory_manager.lock().unwrap();
+                let guest_memory = mm.guest_memory();
+                let mem = guest_memory.memory();
+                mem.iter()
+                    .map(|region| (region.start_addr().raw_value(), region.len()))
+                    .collect::<Vec<_>>()
+            };
+            self.cpu_manager.lock().unwrap().pre_fault_memory(&ranges);
+        }
 
         // Now we can start all vCPUs from here.
         self.cpu_manager
