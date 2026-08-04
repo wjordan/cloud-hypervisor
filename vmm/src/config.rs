@@ -4264,6 +4264,7 @@ mod unit_tests {
             tag: "mytag".to_owned(),
             num_queues: 1,
             queue_size: 1024,
+            dax: false,
         }
     }
 
