@@ -18,7 +18,8 @@ use std::io::Write;
 use std::mem::size_of;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
+use std::time::Duration;
 use std::{cmp, io, result, thread};
 
 use acpi_tables::sdt::Sdt;
@@ -757,6 +758,56 @@ impl TryFrom<i32> for CoreSchedulingLeader {
     }
 }
 
+/// A boolean flag that wakes blocked waiters on every store, so state
+/// transitions are acknowledged without sleep-polling. Loads and stores stay
+/// lock-free for the run-vCPU loop; only waiters take the lock.
+#[derive(Default)]
+struct AckFlag {
+    state: AtomicBool,
+    lock: Mutex<()>,
+    cond: Condvar,
+}
+
+impl AckFlag {
+    fn store(&self, value: bool) {
+        self.state.store(value, Ordering::SeqCst);
+        // Taking the lock orders the store against a waiter's re-check under
+        // the same lock, so a waiter never parks after missing this store.
+        let _guard = self.lock.lock().unwrap();
+        self.cond.notify_all();
+    }
+
+    /// Blocks until the flag equals `value`.
+    fn wait_for(&self, value: bool) {
+        if self.state.load(Ordering::SeqCst) == value {
+            return;
+        }
+        let mut guard = self.lock.lock().unwrap();
+        while self.state.load(Ordering::SeqCst) != value {
+            guard = self.cond.wait(guard).unwrap();
+        }
+    }
+
+    /// Blocks until the flag equals `value` or `timeout` elapses. Returns
+    /// whether the flag reached `value`.
+    fn wait_for_timeout(&self, value: bool, timeout: Duration) -> bool {
+        if self.state.load(Ordering::SeqCst) == value {
+            return true;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        let mut guard = self.lock.lock().unwrap();
+        while self.state.load(Ordering::SeqCst) != value {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (g, _) = self.cond.wait_timeout(guard, deadline - now).unwrap();
+            guard = g;
+        }
+        true
+    }
+}
+
 /// Management structure for a vCPU (thread).
 #[derive(Default)]
 struct VcpuState {
@@ -768,9 +819,9 @@ struct VcpuState {
     /// Instructs the thread to exit the run-vCPU loop.
     kill: Arc<AtomicBool>,
     /// Used to ACK interruption from the run vCPU loop to the CPU Manager.
-    vcpu_run_interrupted: Arc<AtomicBool>,
+    vcpu_run_interrupted: Arc<AckFlag>,
     /// Used to ACK state changes from the run vCPU loop to the CPU Manager.
-    paused: Arc<AtomicBool>,
+    paused: Arc<AckFlag>,
 }
 
 impl VcpuState {
@@ -803,25 +854,28 @@ impl VcpuState {
     ///
     /// This is the counterpart of [`Self::signal_thread`].
     fn wait_until_signal_acknowledged(&self) -> Result<()> {
-        if let Some(_handle) = self.handle.as_ref() {
-            let mut count = 0;
-            loop {
-                if self.vcpu_run_interrupted.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-                // This is more effective than thread::yield_now() at
-                // avoiding a priority inversion with the vCPU thread
-                thread::sleep(std::time::Duration::from_millis(1));
-                count += 1;
-                if count >= 1000 {
-                    return Err(Error::SignalAcknowledgeTimeout);
-                } else if count % 10 == 0 {
-                    warn!("vCPU thread did not respond in {count}ms to signal - retrying");
-                    self.signal_thread();
-                }
-            }
+        if self.handle.is_none() {
+            return Ok(());
         }
-        Ok(())
+        let retry_interval = Duration::from_millis(10);
+        let mut waited = Duration::ZERO;
+        loop {
+            if self
+                .vcpu_run_interrupted
+                .wait_for_timeout(true, retry_interval)
+            {
+                return Ok(());
+            }
+            waited += retry_interval;
+            if waited >= Duration::from_millis(1000) {
+                return Err(Error::SignalAcknowledgeTimeout);
+            }
+            warn!(
+                "vCPU thread did not respond in {}ms to signal - retrying",
+                waited.as_millis()
+            );
+            self.signal_thread();
+        }
     }
 
     fn join_thread(&mut self) -> Result<()> {
@@ -1323,18 +1377,18 @@ impl CpuManager {
                                     vcpu.lock().unwrap().vcpu.set_immediate_exit(false);
                                 }
 
-                                vcpu_run_interrupted.store(true, Ordering::SeqCst);
+                                vcpu_run_interrupted.store(true);
 
-                                vcpu_paused.store(true, Ordering::SeqCst);
+                                vcpu_paused.store(true);
                                 while vcpus_pause_signalled.load(Ordering::SeqCst) {
                                     thread::park();
                                 }
-                                vcpu_paused.store(false, Ordering::SeqCst);
-                                vcpu_run_interrupted.store(false, Ordering::SeqCst);
+                                vcpu_paused.store(false);
+                                vcpu_run_interrupted.store(false);
                             }
 
                             if vcpus_kick_signalled.load(Ordering::SeqCst) {
-                                vcpu_run_interrupted.store(true, Ordering::SeqCst);
+                                vcpu_run_interrupted.store(true);
                                 #[cfg(target_arch = "x86_64")]
                                 match vcpu.lock().as_ref().unwrap().vcpu.nmi() {
                                     Ok(()) => {},
@@ -1349,7 +1403,7 @@ impl CpuManager {
                             if vcpus_kill_signalled.load(Ordering::SeqCst)
                                 || vcpu_kill.load(Ordering::SeqCst)
                             {
-                                vcpu_run_interrupted.store(true, Ordering::SeqCst);
+                                vcpu_run_interrupted.store(true);
                                 break;
                             }
 
@@ -1382,13 +1436,13 @@ impl CpuManager {
                                     VmExit::Hyperv => {}
                                     VmExit::Reset => {
                                         info!("VmExit::Reset");
-                                        vcpu_run_interrupted.store(true, Ordering::SeqCst);
+                                        vcpu_run_interrupted.store(true);
                                         reset_evt.write(1).unwrap();
                                         break;
                                     }
                                     VmExit::Shutdown => {
                                         info!("VmExit::Shutdown");
-                                        vcpu_run_interrupted.store(true, Ordering::SeqCst);
+                                        vcpu_run_interrupted.store(true);
                                         exit_evt.write(1).unwrap();
                                         break;
                                     }
@@ -1409,7 +1463,7 @@ impl CpuManager {
 
                                 Err(e) => {
                                     error!("VCPU generated error: {:?}", Error::VcpuRun(e.into()));
-                                    vcpu_run_interrupted.store(true, Ordering::SeqCst);
+                                    vcpu_run_interrupted.store(true);
                                     exit_evt.write(1).unwrap();
                                     break;
                                 }
@@ -1419,13 +1473,13 @@ impl CpuManager {
                             if vcpus_kill_signalled.load(Ordering::SeqCst)
                                 || vcpu_kill.load(Ordering::SeqCst)
                             {
-                                vcpu_run_interrupted.store(true, Ordering::SeqCst);
+                                vcpu_run_interrupted.store(true);
                                 break;
                             }
                         }
                     })
                     .or_else(|_| {
-                        panic_vcpu_run_interrupted.store(true, Ordering::SeqCst);
+                        panic_vcpu_run_interrupted.store(true);
                         error!("vCPU thread panicked");
                         panic_exit_evt.write(1)
                     })
@@ -2663,11 +2717,7 @@ impl Pausable for CpuManager {
         // activated vCPU change their state to ensure they have parked.
         for state in self.vcpu_states.lock().unwrap().iter() {
             if state.active() {
-                // wait for vCPU to update state
-                while !state.paused.load(Ordering::SeqCst) {
-                    // To avoid a priority inversion with the vCPU thread
-                    thread::sleep(std::time::Duration::from_millis(1));
-                }
+                state.paused.wait_for(true);
             }
         }
 
@@ -2691,11 +2741,7 @@ impl Pausable for CpuManager {
         // Step 2/2: wait for state ACK
         {
             for state in vcpu_states.iter() {
-                // wait for vCPU to update state
-                while state.paused.load(Ordering::SeqCst) {
-                    // To avoid a priority inversion with the vCPU thread
-                    thread::sleep(std::time::Duration::from_millis(1));
-                }
+                state.paused.wait_for(false);
             }
         }
         Ok(())
