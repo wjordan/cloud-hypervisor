@@ -93,8 +93,8 @@ use iommufd_ioctls::IommuFd;
 #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
 use iommufd_ioctls::{AttachHwpt, IommufdVIommu};
 use libc::{
-    MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, O_TMPFILE, PROT_READ, PROT_WRITE, TCSANOW, tcsetattr,
-    termios,
+    MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, O_TMPFILE, PROT_NONE, PROT_READ,
+    PROT_WRITE, TCSANOW, tcsetattr, termios,
 };
 use log::{debug, error, info, warn};
 use net_util::MacAddr;
@@ -120,7 +120,8 @@ use virtio_devices::transport::{
 use virtio_devices::vhost_user::VhostUserConfig;
 use virtio_devices::{
     AccessPlatformMapping, Block, Endpoint, IommuMapping, VdpaDmaMapping, VirtioMemMappingSource,
-    balloon, mem, net, transport, vdpa, vhost_user, vsock,
+    VirtioSharedMemory, VirtioSharedMemoryList, balloon, mem, net, transport, vdpa, vhost_user,
+    vsock,
 };
 use vm_allocator::page_size::get_page_size;
 use vm_allocator::{AddressAllocator, InterruptAllocError, SystemAllocator};
@@ -361,6 +362,9 @@ pub enum DeviceManagerError {
     /// Cannot find a memory range for persistent memory
     #[error("Cannot find a memory range for persistent memory")]
     PmemRangeAllocation,
+
+    #[error("Cannot allocate a virtio-fs DAX memory range")]
+    FsRangeAllocation,
 
     /// Cannot create iommufd
     #[cfg(feature = "kvm")]
@@ -3383,25 +3387,104 @@ impl DeviceManager {
 
         let mut node = device_node!(id);
 
+        // Restore: the DAX window's GPA range was preserved in the device
+        // tree (Resource::MmioAddressRange). Fs::new skips the SHMEM size
+        // negotiation on the restore path, so recover base+size here and
+        // re-allocate the exact same region below — the restored guest's PCI
+        // BAR and virtio-fs driver state still point at it.
+        let saved_dax_range = self.device_tree.lock().unwrap().get(&id).and_then(|node| {
+            node.resources.iter().find_map(|r| match r {
+                Resource::MmioAddressRange { base, size } => Some((*base, *size)),
+                _ => None,
+            })
+        });
+
         if let Some(fs_socket) = fs_cfg.socket.to_str() {
-            let virtio_fs_device = Arc::new(Mutex::new(
-                vhost_user::Fs::new(
-                    id.clone(),
-                    fs_socket,
-                    &fs_cfg.tag,
-                    fs_cfg.num_queues,
-                    fs_cfg.queue_size,
+            let (mut virtio_fs_device, dax_cache_size) = virtio_devices::vhost_user::Fs::new(
+                id.clone(),
+                fs_socket,
+                &fs_cfg.tag,
+                fs_cfg.num_queues,
+                fs_cfg.queue_size,
+                fs_cfg.dax,
+                self.seccomp_action.clone(),
+                self.exit_evt
+                    .try_clone()
+                    .map_err(DeviceManagerError::EventFd)?,
+                self.force_access_platform,
+                state_from_id(snapshot, id.as_str())
+                    .map_err(DeviceManagerError::RestoreGetState)?,
+            )
+            .map_err(DeviceManagerError::CreateVirtioFs)?;
+
+            // When the daemon advertised a DAX window (fresh boot: allocator
+            // picks the GPA) or the snapshot recorded one (restore: pin the
+            // saved GPA), reserve that chunk of 64-bit MMIO space and back it
+            // with an anonymous PROT_NONE mapping. SHMEM_MAP requests from the
+            // daemon will later overlay file pages into this region; until
+            // then any guest access faults.
+            let dax_window = match dax_cache_size {
+                Some(size) => Some((None, size)),
+                None => saved_dax_range.map(|(base, size)| (Some(GuestAddress(base)), size)),
+            };
+            if let Some((fixed_base, cache_size)) = dax_window {
+                let cache_base = self.pci_segments[fs_cfg.pci_common.pci_segment as usize]
+                    .mem64_allocator
+                    .lock()
+                    .unwrap()
+                    .allocate(fixed_base, cache_size as GuestUsize, Some(0x0020_0000))
+                    .ok_or(DeviceManagerError::FsRangeAllocation)?
+                    .raw_value();
+
+                let region_size_usize = cache_size as usize;
+                let mmap_region = MmapRegion::build(
                     None,
-                    self.seccomp_action.clone(),
-                    self.exit_evt
-                        .try_clone()
-                        .map_err(DeviceManagerError::EventFd)?,
-                    self.force_access_platform,
-                    state_from_id(snapshot, id.as_str())
-                        .map_err(DeviceManagerError::RestoreGetState)?,
+                    region_size_usize,
+                    PROT_NONE,
+                    MAP_ANONYMOUS | MAP_PRIVATE,
                 )
-                .map_err(DeviceManagerError::CreateVirtioFs)?,
-            ));
+                .map_err(DeviceManagerError::NewMmapRegion)?;
+                let host_addr = mmap_region.as_ptr();
+
+                // SAFETY: host_addr / region_size_usize delimit a freshly
+                // mmap'd anonymous region we own; the slot is released during
+                // device removal (see remove_userspace_mapping callers).
+                let mem_slot = unsafe {
+                    self.memory_manager
+                        .lock()
+                        .unwrap()
+                        .create_userspace_mapping(
+                            cache_base,
+                            region_size_usize,
+                            host_addr,
+                            false,
+                            false,
+                            false,
+                            hypervisor::MemoryVisibility::Shared,
+                        )
+                        .map_err(DeviceManagerError::MemoryManager)?
+                };
+
+                // The cache occupies a 2 MiB-aligned MMIO range; preserve it
+                // in the device tree so snapshot/restore can re-allocate the
+                // same GPA region.
+                node.resources.push(Resource::MmioAddressRange {
+                    base: cache_base,
+                    size: cache_size,
+                });
+
+                virtio_fs_device.set_cache(VirtioSharedMemoryList {
+                    mem_slot,
+                    addr: GuestAddress(cache_base),
+                    mapping: Arc::new(mmap_region),
+                    region_list: vec![VirtioSharedMemory {
+                        offset: 0,
+                        len: cache_size,
+                    }],
+                });
+            }
+
+            let virtio_fs_device = Arc::new(Mutex::new(virtio_fs_device));
 
             // Update the device tree with the migratable device.
             node.migratable = Some(Arc::clone(&virtio_fs_device) as Arc<Mutex<dyn Migratable>>);

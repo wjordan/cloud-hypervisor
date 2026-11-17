@@ -1460,6 +1460,9 @@ impl Vmm {
                 self.console_resize_pipe.clone(),
                 Arc::clone(&self.original_termios_opt),
                 Some(&snapshot),
+                // Migration streams its memory in ahead of resume, so there is
+                // nothing here for a pre-fault pass to save.
+                false,
                 #[cfg(feature = "igvm")]
                 None,
             )
@@ -2083,6 +2086,7 @@ impl Vmm {
         source_url: &str,
         vm_config: Arc<Mutex<VmConfig>>,
         prefault: bool,
+        pre_fault_memory: bool,
         memory_restore_mode: MemoryRestoreMode,
     ) -> result::Result<(), VmError> {
         match &self.vm {
@@ -2135,6 +2139,7 @@ impl Vmm {
                     Some(&snapshot),
                     Some(source_url),
                     Some(prefault),
+                    Some(pre_fault_memory),
                     Some(memory_restore_mode),
                 )?;
 
@@ -2573,6 +2578,7 @@ impl RequestHandler for Vmm {
                             None,
                             None,
                             None,
+                            None,
                         )?;
 
                         let r = vm.boot();
@@ -2714,6 +2720,7 @@ impl RequestHandler for Vmm {
                     source_url,
                     vm_config,
                     restore_cfg.prefault,
+                    restore_cfg.pre_fault_memory,
                     restore_cfg.memory_restore_mode,
                 )
                 .and_then(|()| {
@@ -2816,6 +2823,7 @@ impl RequestHandler for Vmm {
             self.console_info.clone(),
             self.console_resize_pipe.clone(),
             Arc::clone(&self.original_termios_opt),
+            None,
             None,
             None,
             None,
