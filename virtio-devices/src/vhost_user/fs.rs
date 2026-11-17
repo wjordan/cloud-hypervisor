@@ -160,6 +160,29 @@ pub struct Fs {
     exit_evt: EventFd,
 }
 
+// DAX filesystem snapshots from before SHMEM was standardized used bit 21.
+// This frontend never negotiates GPA_ADDRESSES for a filesystem. Prefer the
+// standard encoding, while keeping restores against legacy daemons working.
+pub(super) fn restore_fs_protocol_features(
+    vu: &mut VhostUserHandle,
+    dax: bool,
+    features: u64,
+    saved: u64,
+) -> Result<u64> {
+    let legacy = 1u64 << 21;
+    let shmem = VhostUserProtocolFeatures::SHMEM.bits();
+    if dax && saved & legacy != 0 && saved & shmem == 0 {
+        let translated = (saved & !legacy) | shmem;
+        match vu.set_protocol_features_vhost_user(features, translated) {
+            Ok(()) => return Ok(translated),
+            Err(Error::UnsupportedProtocolFeatures(missing)) if missing == shmem => {}
+            Err(err) => return Err(err),
+        }
+    }
+    vu.set_protocol_features_vhost_user(features, saved)?;
+    Ok(saved)
+}
+
 impl Fs {
     /// Create a new virtio-fs device.
     ///
@@ -213,7 +236,9 @@ impl Fs {
         ) = if let Some(state) = state {
             info!("Restoring vhost-user-fs {id}");
 
-            vu.set_protocol_features_vhost_user(
+            let restored_protocol_features = restore_fs_protocol_features(
+                &mut vu,
+                dax_enabled,
                 state.acked_features,
                 state.acked_protocol_features,
             )?;
@@ -223,7 +248,7 @@ impl Fs {
             (
                 state.avail_features,
                 state.acked_features,
-                state.acked_protocol_features,
+                restored_protocol_features,
                 state.vu_num_queues,
                 state.config,
                 true,

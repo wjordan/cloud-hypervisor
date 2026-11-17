@@ -1060,60 +1060,88 @@ mod tests {
 
     #[test]
     fn restored_protocol_features_must_be_supported() {
-        let protocol_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
         let mq = VhostUserProtocolFeatures::MQ.bits();
         let config = VhostUserProtocolFeatures::CONFIG.bits();
         for (saved, available) in [(mq, mq | config), (mq, config), (1u64 << 63, mq)] {
-            let missing = saved & !available;
-            let temp_dir = TempDir::new_with_prefix("/tmp/vhost-user-protocol-").unwrap();
-            let socket_path = temp_dir.as_path().join("backend.sock");
-            let listener = UnixListener::bind(&socket_path).unwrap();
-            let backend = thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                assert!(read_request(&mut stream, FrontendReq::SET_OWNER).is_empty());
-                for (request, value) in [
-                    (FrontendReq::GET_FEATURES, protocol_features),
-                    (FrontendReq::GET_PROTOCOL_FEATURES, available),
-                ] {
-                    assert!(read_request(&mut stream, request).is_empty());
-                    for field in [u32::from(request), VhostUserHeaderFlag::REPLY.bits() | 1, 8] {
-                        stream.write_all(&field.to_ne_bytes()).unwrap();
-                    }
-                    stream.write_all(&value.to_ne_bytes()).unwrap();
-                }
-                if missing == 0 {
-                    assert_eq!(
-                        read_request(&mut stream, FrontendReq::SET_PROTOCOL_FEATURES),
-                        saved.to_ne_bytes()
-                    );
-                }
-                // An incompatible connection must close before sending any
-                // protocol settings, device state, or memory addresses.
-                assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
-            });
-
-            let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-            let result = VhostUserHandle::connect_vhost_user(
-                false,
-                socket_path.to_str().unwrap(),
-                1,
-                false,
-                &kill_evt,
-                |vu| vu.set_protocol_features_vhost_user(protocol_features, saved),
-            );
-            match result {
-                Ok(vu) => {
-                    assert_eq!(missing, 0);
-                    drop(vu);
-                }
-                Err(Error::UnsupportedProtocolFeatures(bits)) => {
-                    assert_ne!(missing, 0);
-                    assert_eq!(bits, missing);
-                }
-                Err(err) => panic!("Unexpected negotiation error: {err}"),
-            }
-            backend.join().unwrap();
+            check_restore_negotiation(saved, available, None, saved, 1);
         }
+    }
+
+    #[test]
+    fn restore_dax_snapshot_with_legacy_shmem() {
+        let legacy = 1u64 << 21;
+        let shmem = VhostUserProtocolFeatures::SHMEM.bits();
+        let mq = VhostUserProtocolFeatures::MQ.bits();
+        check_restore_negotiation(mq | legacy, mq | shmem, Some(true), mq | shmem, 1);
+        check_restore_negotiation(mq | legacy, mq | legacy, Some(true), mq | legacy, 2);
+        check_restore_negotiation(mq | shmem, mq | shmem, Some(true), mq | shmem, 1);
+        check_restore_negotiation(mq | legacy, mq | shmem, Some(false), mq | legacy, 1);
+        check_restore_negotiation(mq | legacy, shmem, Some(true), mq | shmem, 1);
+    }
+
+    fn check_restore_negotiation(
+        saved: u64,
+        available: u64,
+        fs_dax: Option<bool>,
+        expected: u64,
+        protocol_queries: usize,
+    ) {
+        let protocol_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+        let missing = expected & !available;
+        let temp_dir = TempDir::new_with_prefix("/tmp/vhost-user-protocol-").unwrap();
+        let socket_path = temp_dir.as_path().join("backend.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let backend = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request(&mut stream, FrontendReq::SET_OWNER).is_empty());
+            for (request, value) in std::iter::once((FrontendReq::GET_FEATURES, protocol_features))
+                .chain(std::iter::repeat_n(
+                    (FrontendReq::GET_PROTOCOL_FEATURES, available),
+                    protocol_queries,
+                ))
+            {
+                assert!(read_request(&mut stream, request).is_empty());
+                for field in [u32::from(request), VhostUserHeaderFlag::REPLY.bits() | 1, 8] {
+                    stream.write_all(&field.to_ne_bytes()).unwrap();
+                }
+                stream.write_all(&value.to_ne_bytes()).unwrap();
+            }
+            if missing == 0 {
+                assert_eq!(
+                    read_request(&mut stream, FrontendReq::SET_PROTOCOL_FEATURES),
+                    expected.to_ne_bytes()
+                );
+            }
+            // An incompatible connection must close before sending any
+            // protocol settings, device state, or memory addresses.
+            assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
+        });
+
+        let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let result = VhostUserHandle::connect_vhost_user(
+            false,
+            socket_path.to_str().unwrap(),
+            1,
+            false,
+            &kill_evt,
+            |vu| match fs_dax {
+                Some(dax) => fs::restore_fs_protocol_features(vu, dax, protocol_features, saved)
+                    .map(|actual| assert_eq!(actual, expected)),
+                None => vu.set_protocol_features_vhost_user(protocol_features, saved),
+            },
+        );
+        match result {
+            Ok(vu) => {
+                assert_eq!(missing, 0);
+                drop(vu);
+            }
+            Err(Error::UnsupportedProtocolFeatures(bits)) => {
+                assert_ne!(missing, 0);
+                assert_eq!(bits, missing);
+            }
+            Err(err) => panic!("Unexpected negotiation error: {err}"),
+        }
+        backend.join().unwrap();
     }
 
     #[test]
